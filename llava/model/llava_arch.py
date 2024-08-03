@@ -96,6 +96,21 @@ class LlavaMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
+        if getattr(model_args, 'token_merging', False):
+            from .token_merging import SDlikeTokenMerging
+            if "patch14" in model_args.vision_tower:
+                patch_size = 14
+            elif "patch16" in model_args.vision_tower:
+                patch_size = 16
+            
+            w = h = ( vision_tower.image_processor.size['shortest_edge'] // patch_size )
+            sx = sy = model_args.token_merging_s
+            r = model_args.token_merging_r
+
+            self.token_merging = SDlikeTokenMerging(
+                w=w, h=h, sx=sx, sy=sy, r=r
+            )
+
 
 def unpad_image(tensor, original_size):
     """
@@ -149,6 +164,8 @@ class LlavaMetaForCausalLM(ABC):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
+
+        # print(f"1/ images: {images.size()}") # batch, 3, 224, 224
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
@@ -204,7 +221,14 @@ class LlavaMetaForCausalLM(ABC):
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError
+        
+        if hasattr(self.get_model(), "token_merging"):
+            # print(f"Before merge: {image_features.size()}")
+            image_features = self.get_model().token_merging(image_features)
+            # print(f"After merge: {image_features.size()}")
 
+        # print(f"2/ image_features: {image_features.size()}") # batch, 256, 4096
+        
         # Let's just add dummy tensors if they do not exist,
         # it is a headache to deal with None all the time.
         # But it is not ideal, and if you have a better idea,

@@ -23,6 +23,7 @@ deepspeed llava/train/train_mem.py \
     --shard_pattern './data/shards/shard-{00000..00558}.tar' \
     --shard_size 1000 \
     --vision_tower openai/clip-vit-large-patch14 \
+    --token_merging True \
     --tune_mm_mlp_adapter True \
     --mm_vision_select_layer -2 \
     --mm_use_im_start_end False \

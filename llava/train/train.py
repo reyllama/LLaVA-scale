@@ -67,6 +67,9 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    token_merging: bool = field(default=False)
+    token_merging_s: int = field(default=2)
+    token_merging_r: float = field(default=0.5)
 
 
 @dataclass
