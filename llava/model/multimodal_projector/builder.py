@@ -30,11 +30,16 @@ class SimpleResBlock(nn.Module):
         return x + self.proj(x)
 
 
-def build_vision_projector(config, delay_load=False, **kwargs):
-    projector_type = getattr(config, 'mm_projector_type', 'linear') # linear
+def build_projector(config, projector_name_type=None, delay_load=False, **kwargs):
+    projector_type = getattr(config, projector_name_type, 'linear') # linear
 
     if projector_type == 'linear':
-        return nn.Linear(config.mm_hidden_size, config.hidden_size)
+        if projector_name_type == 'mm_projector_type':
+            return nn.Linear(config.mm_hidden_size, config.hidden_size)
+        elif projector_name_type == "audio_projector_type":
+            return nn.Linear(config.audio_hidden_size, config.hidden_size)
+        else:
+            raise ValueError(f'Unknown projector type: {projector_type}')
 
     mlp_gelu_match = re.match(r'^mlp(\d+)x_gelu$', projector_type)
     if mlp_gelu_match:

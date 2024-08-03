@@ -36,6 +36,7 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token, tokenizer_MMODAL_token
+from llava.mm_utils import process_video as _process_video
 # from llava.webdataset import *
 
 from PIL import Image
@@ -70,6 +71,9 @@ class ModelArguments:
     token_merging: bool = field(default=False)
     token_merging_s: int = field(default=2)
     token_merging_r: float = field(default=0.25)
+    audio_tower: Optional[str] = field(default=None)
+    audio_hidden_size: Optional[int] = field(default=768)
+    tune_audio_mlp_adapter: bool = field(default=False)
 
 
 @dataclass
@@ -93,6 +97,7 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
+    freeze_audio_mlp_adapter: bool = field(default=False)
     mpt_attn_impl: Optional[str] = field(default="triton")
     model_max_length: int = field(
         default=512,
@@ -120,6 +125,7 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
+    audio_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
 
 
@@ -825,7 +831,8 @@ class WebDataset(Dataset):
             .map(self.decode_sample)
         )
         self.iterator = iter(self.dataset)
-        self.modals = ["image", "video", "audio"]
+        # self.modals = ["image", "video", "audio"]
+        self.modals = ["video", "audio"] # Placeholder data for video+audio
 
     def decode_sample(self, sample):
 
@@ -833,6 +840,12 @@ class WebDataset(Dataset):
         conversations = metadata["conversations"]
         decoded_sample = dict()
         modal_list = list()
+
+        if 'mp4' in sample:
+            video = sample["mp4"]
+            video = self.process_video(video) # 
+            decoded_sample["video"] = video
+            modal_list.append('VIDEO')
 
         if 'jpg' in sample:
             image = sample["jpg"]
@@ -855,12 +868,6 @@ class WebDataset(Dataset):
                 image = self.data_args.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             decoded_sample["image"] = image
             modal_list.append('IMAGE')
-        
-        if 'mp4' in sample:
-            video = sample["mp4"]
-            video = self.process_video(video)
-            decoded_sample["video"] = video
-            modal_list.append('VIDEO')
 
         if 'mp3' in sample:
             audio = sample["mp3"]
@@ -882,6 +889,13 @@ class WebDataset(Dataset):
         except StopIteration:
             self.iterator = iter(self.dataset)
             sample = next(self.iterator)
+
+        ################# placeholder for video+audio ###################
+        sample['modal_list'] = ['VIDEO', 'AUDIO']
+        sample['video'] = torch.stack([sample['image']] * self.data_args.num_frames)
+        sample['audio'] = torch.randn(10000)
+        #################################################################
+
         conversations = preprocess_multimodal(copy.deepcopy([sample["conversations"]]), self.data_args)
         data_dict = preprocess(conversations, self.tokenizer, sample['modal_list']) # TODO
         data_dict = dict(input_ids=data_dict["input_ids"][0],
@@ -891,6 +905,27 @@ class WebDataset(Dataset):
                 data_dict[modal] = sample[modal]
         return data_dict
 
+    def process_video(self, video):
+
+        return _process_video(video, self.data_args.image_processor, num_frames=self.data_args.num_frames)
+
+    def preprocess_audio(file_path, target_sr=16000):
+    
+        # y, sr = librosa.load(file_path, sr=None)
+        
+        # if sr != target_sr:
+        #     y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+        
+        # if len(y.shape) > 1:
+        #     y = librosa.to_mono(y)
+        
+        # y = y / np.max(np.abs(y))
+
+        # audio_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
+        
+        audio_tensor = torch.randn(10000)
+
+        return audio_tensor
 
 @dataclass
 class DataCollatorForWebDataset(object):
@@ -916,12 +951,14 @@ class DataCollatorForWebDataset(object):
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
 
-        if 'image' in instances[0]:
-            images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
-            else:
-                batch['images'] = images
+        for modal in ['image', 'video', 'audio']:
+            if modal in instances[0]:
+                modal_data = [instance[modal] for instance in instances]
+                # print(f"modal: {modal}, modal_data: {modal_data}")
+                if all(x is not None and x.shape == modal_data[0].shape for x in modal_data):
+                    batch[f"{modal}s"] = torch.stack(modal_data)
+                else:
+                    batch[f"{modal}s"] = modal_data
 
         return batch
 
@@ -1101,7 +1138,32 @@ def train(attn_implementation=None):
         model.config.mm_projector_lr = training_args.mm_projector_lr
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-        model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        model.initialize_MM_tokenizer(model_args, tokenizer=tokenizer)
+
+    if model_args.audio_tower is not None:
+        model.get_model().initialize_audio_modules(
+            model_args=model_args,
+            fsdp=training_args.fsdp
+        )
+
+        audio_tower = model.get_audio_tower()
+        audio_tower.to(dtype=torch.float16, device=training_args.device)
+
+        model.config.tune_audio_mlp_adapter = training_args.tune_audio_mlp_adapter = model_args.tune_audio_mlp_adapter
+        if model_args.tune_audio_mlp_adapter:
+            model.requires_grad_(False)
+            for p in model.get_model().audio_projector.parameters():
+                p.requires_grad = True
+
+        model.config.freeze_audio_mlp_adapter = training_args.freeze_audio_mlp_adapter
+        if training_args.freeze_audio_mlp_adapter:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = False
+
+        if training_args.bits in [4, 8]:
+            model.get_model().audio_projector.to(dtype=compute_dtype, device=training_args.device)
+
+        model.config.audio_projector_lr = training_args.audio_projector_lr
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer

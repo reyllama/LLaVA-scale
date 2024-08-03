@@ -18,10 +18,10 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
-from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder import build_vision_projector
+from .multimodal_encoder.builder import build_vision_tower, build_audio_tower
+from .multimodal_projector.builder import build_projector
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, MMODAL_TOKEN_INDEX
 
 from llava.mm_utils import get_anyres_image_grid_shape
 
@@ -33,7 +33,7 @@ class LlavaMetaModel:
 
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)
-            self.mm_projector = build_vision_projector(config)
+            self.mm_projector = build_projector(config, projector_name_type='mm_projector_type')
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
@@ -45,6 +45,42 @@ class LlavaMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
+
+    def get_audio_tower(self):
+        return getattr(self, 'audio_tower', None)
+        if type(audio_tower) is list:
+            audio_tower = audio_tower[0]
+        return audio_tower
+
+    def initialize_audio_modules(self, model_args, fsdp=None):
+        
+        audio_tower = model_args.audio_tower # TODO
+        
+        self.config.mm_audio_tower = audio_tower
+
+        if self.get_audio_tower() is None:
+            audio_tower = build_audio_tower(model_args)
+
+            if fsdp is not None and len(fsdp) > 0:
+                self.audio_tower = [audio_tower]
+            else:
+                self.audio_tower = audio_tower
+        else:
+            if fsdp is not None and len(fsdp) > 0:
+                audio_tower = self.audio_tower[0]
+            else:
+                audio_tower = self.audio_tower
+        
+        self.config.use_audio_proj = True
+        self.config.audio_projector_type = getattr(model_args, 'audio_projector_type', 'linear')
+        self.config.audio_hidden_size = getattr(model_args, 'audio_hidden_size', audio_tower.hidden_size)
+
+        if getattr(self, 'audio_projector', None) is None:
+            self.audio_projector = build_projector(self.config, projector_name_type='audio_projector_type')
+
+        else:
+            for p in self.audio_projector.parameters():
+                p.requires_grad = True
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -77,7 +113,7 @@ class LlavaMetaModel:
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
         if getattr(self, 'mm_projector', None) is None:
-            self.mm_projector = build_vision_projector(self.config)
+            self.mm_projector = build_projector(self.config, projector_name_type='mm_projector_type')
 
             if 'unpad' in mm_patch_merge_type:
                 embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
@@ -152,90 +188,116 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
+    def get_audio_tower(self):
+        return self.get_model().get_audio_tower()
+
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    # def encode_videos(self, videos):
+    #     assert videos.ndim == 5, f"Expected 5D tensor, got {videos.ndim}D tensor."
+    #     b, n, c, h, w = videos.shape
+    #     videos = videos.view(b * n, c, h, w)
+    #     video_features = self.get_model().get_vision_tower()(videos)
+    #     video_features = self.get_model().mm_projector(video_features)
+    #     return video_features.reshape(b, n, c, h, w)
+
+    def encode_audio(self, audio):
+        audio = audio.to(dtype=torch.float16)
+        padding = torch.zeros_like(audio).bool()
+        audio_features = self.get_model().get_audio_tower().to(dtype=torch.float16).extract_features(audio, padding)[0]
+        audio_features = self.get_model().audio_projector.to(dtype=torch.float16)(audio_features)
+        return audio_features.to(dtype=torch.bfloat16)
+
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images=None, image_sizes=None, videos=None, audios=None
     ):
-        vision_tower = self.get_vision_tower()
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
+        
+        MODAL_TOKEN_INDEX = IMAGE_TOKEN_INDEX
+
+        if all(x is None for x in [images, videos, audios]) or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
 
-        # print(f"1/ images: {images.size()}") # batch, 3, 224, 224
+        if videos is not None and images is not None:
+            raise ValueError("Cannot provide both images and videos at the same time for now.")
 
-        if type(images) is list or images.ndim == 5:
-            if type(images) is list:
-                images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
-            concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
-            split_sizes = [image.shape[0] for image in images]
-            image_features = torch.split(image_features, split_sizes, dim=0)
-            mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
-            image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
-            if mm_patch_merge_type == 'flat':
-                image_features = [x.flatten(0, 1) for x in image_features]
-            elif mm_patch_merge_type.startswith('spatial'):
-                new_image_features = []
-                for image_idx, image_feature in enumerate(image_features):
-                    if image_feature.shape[0] > 1:
-                        base_image_feature = image_feature[0]
-                        image_feature = image_feature[1:]
-                        height = width = self.get_vision_tower().num_patches_per_side
-                        assert height * width == base_image_feature.shape[0]
-                        if image_aspect_ratio == 'anyres':
-                            num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, self.get_vision_tower().config.image_size)
-                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+        if videos is not None and images is None:
+            images = videos
+            MODAL_TOKEN_INDEX = MMODAL_TOKEN_INDEX['VIDEO']
+
+        if images is not None:
+            vision_tower = self.get_vision_tower()
+
+            if type(images) is list or images.ndim == 5:
+                if type(images) is list:
+                    images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+                concat_images = torch.cat([image for image in images], dim=0)
+                image_features = self.encode_images(concat_images)
+                split_sizes = [image.shape[0] for image in images]
+                image_features = torch.split(image_features, split_sizes, dim=0)
+                mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
+                image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
+                if mm_patch_merge_type == 'flat':
+                    image_features = [x.flatten(0, 1) for x in image_features]
+                elif mm_patch_merge_type.startswith('spatial'):
+                    new_image_features = []
+                    for image_idx, image_feature in enumerate(image_features):
+                        if image_feature.shape[0] > 1:
+                            base_image_feature = image_feature[0]
+                            image_feature = image_feature[1:]
+                            height = width = self.get_vision_tower().num_patches_per_side
+                            assert height * width == base_image_feature.shape[0]
+                            if image_aspect_ratio == 'anyres':
+                                num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, self.get_vision_tower().config.image_size)
+                                image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                            else:
+                                raise NotImplementedError
+                            if 'unpad' in mm_patch_merge_type:
+                                image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+                                image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+                                image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                                image_feature = torch.cat((
+                                    image_feature,
+                                    self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)
+                                ), dim=-1)
+                                image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                            else:
+                                image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
+                                image_feature = image_feature.flatten(0, 3)
+                            image_feature = torch.cat((base_image_feature, image_feature), dim=0)
                         else:
-                            raise NotImplementedError
-                        if 'unpad' in mm_patch_merge_type:
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            image_feature = torch.cat((
-                                image_feature,
-                                self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)
-                            ), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        else:
-                            image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
-                            image_feature = image_feature.flatten(0, 3)
-                        image_feature = torch.cat((base_image_feature, image_feature), dim=0)
-                    else:
-                        image_feature = image_feature[0]
-                        if 'unpad' in mm_patch_merge_type:
-                            image_feature = torch.cat((
-                                image_feature,
-                                self.model.image_newline[None].to(image_feature.device)
-                            ), dim=0)
-                    new_image_features.append(image_feature)
-                image_features = new_image_features
+                            image_feature = image_feature[0]
+                            if 'unpad' in mm_patch_merge_type:
+                                image_feature = torch.cat((
+                                    image_feature,
+                                    self.model.image_newline[None].to(image_feature.device)
+                                ), dim=0)
+                        new_image_features.append(image_feature)
+                    image_features = new_image_features
+                else:
+                    raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
             else:
-                raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
+                image_features = self.encode_images(images)
+
+        if isinstance(image_features, list):
+            image_features = torch.stack(image_features)
+
+        if audios is not None:
+            audio_features = self.encode_audio(audios)
+            mmodal_features = torch.cat([image_features, audio_features], dim=1)
+
         else:
-            image_features = self.encode_images(images)
+            mmodal_features = image_features
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
             raise NotImplementedError
         
         if hasattr(self.get_model(), "token_merging"):
-            # print(f"Before merge: {image_features.size()}")
-            _image_features = self.get_model().token_merging(image_features)
-            # print(f"After merge: {image_features.size()}")
-
-        # print if rank == 0
-        if torch.distributed.get_rank() == 0:
-            # print(f"* image_features: {_image_features.size()}") # batch, 256, 4096
-            if _image_features.size(1) < 256:
-                pass
-                # print("before: ", image_features[0, :5].data)
-                # print("after: ", _image_features[0, :5].data)
-
-        image_features = _image_features
+            mmodal_features = self.get_model().token_merging(mmodal_features)
 
         # Let's just add dummy tensors if they do not exist,
         # it is a headache to deal with None all the time.
@@ -263,24 +325,30 @@ class LlavaMetaForCausalLM(ABC):
         new_labels = []
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+            num_images = (cur_input_ids == MODAL_TOKEN_INDEX).sum()
             if num_images == 0:
-                cur_image_features = image_features[cur_image_idx]
+                cur_mmodal_features = mmodal_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_mmodal_features[0:0]], dim=0)
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
 
-            image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            image_token_indices = [-1] + torch.where(cur_input_ids == MODAL_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
+            
             cur_input_ids_noim = []
             cur_labels = labels[batch_idx]
             cur_labels_noim = []
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
+
+                if audios is not None:
+                    image_token_indices = image_token_indices[:1] + [image_token_indices[1] + 1] + image_token_indices[1:]
+
             split_sizes = [x.shape[0] for x in cur_labels_noim]
+
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
             cur_new_input_embeds = []
@@ -290,22 +358,15 @@ class LlavaMetaForCausalLM(ABC):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
                 if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
+                    cur_mmodal_features = mmodal_features[cur_image_idx]
                     cur_image_idx += 1
-                    cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_input_embeds.append(cur_mmodal_features)
+                    cur_new_labels.append(torch.full((cur_mmodal_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
-
-            # if cur_image_features.shape[0] < 256:
-            #     if torch.distributed.get_rank() == 0:
-            #         print(f"* cur_image_features: {cur_image_features.size()}")
-            #         print(f"* cur_new_input_embeds: {cur_new_input_embeds.size()}")
-            #         print(f"* cur_new_labels: {cur_new_labels.size()}")
-
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
@@ -364,6 +425,7 @@ class LlavaMetaForCausalLM(ABC):
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
+
         if model_args.mm_use_im_patch_token:
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
             self.resize_token_embeddings(len(tokenizer))
@@ -394,6 +456,54 @@ class LlavaMetaForCausalLM(ABC):
                 mm_projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location='cpu')
                 embed_tokens_weight = mm_projector_weights['model.embed_tokens.weight']
                 assert num_new_tokens == 2
+                if input_embeddings.shape == embed_tokens_weight.shape:
+                    input_embeddings[-num_new_tokens:] = embed_tokens_weight[-num_new_tokens:]
+                elif embed_tokens_weight.shape[0] == num_new_tokens:
+                    input_embeddings[-num_new_tokens:] = embed_tokens_weight
+                else:
+                    raise ValueError(f"Unexpected embed_tokens_weight shape. Pretrained: {embed_tokens_weight.shape}. Current: {input_embeddings.shape}. Numer of new tokens: {num_new_tokens}.")
+        elif model_args.mm_use_im_patch_token:
+            if model_args.tune_mm_mlp_adapter:
+                for p in self.get_input_embeddings().parameters():
+                    p.requires_grad = False
+                for p in self.get_output_embeddings().parameters():
+                    p.requires_grad = False
+
+    def initialize_MM_tokenizer(self, model_args, tokenizer):
+        if model_args.mm_use_im_patch_token:
+            for modal in ['IMAGE', 'VIDEO', 'AUDIO']:
+                tokenizer.add_tokens([DEFAULT_MMODAL_PATCH_TOKEN[modal.upper()]], special_tokens=True)
+            # tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
+            self.resize_token_embeddings(len(tokenizer))
+
+        if model_args.mm_use_im_start_end:
+            num_new_tokens = 0
+            for modal in ['IMAGE', 'VIDEO', 'AUDIO']:
+                num_new_tokens += tokenizer.add_tokens([DEFAULT_MMODAL_START_TOKEN[modal.upper()], DEFAULT_MMODAL_END_TOKEN[modal.upper()]], special_tokens=True)
+            self.resize_token_embeddings(len(tokenizer))
+
+            if num_new_tokens > 0:
+                input_embeddings = self.get_input_embeddings().weight.data
+                output_embeddings = self.get_output_embeddings().weight.data
+
+                input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
+                    dim=0, keepdim=True)
+                output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
+                    dim=0, keepdim=True)
+
+                input_embeddings[-num_new_tokens:] = input_embeddings_avg
+                output_embeddings[-num_new_tokens:] = output_embeddings_avg
+
+            if model_args.tune_mm_mlp_adapter:
+                for p in self.get_input_embeddings().parameters():
+                    p.requires_grad = True
+                for p in self.get_output_embeddings().parameters():
+                    p.requires_grad = False
+
+            if model_args.pretrain_mm_mlp_adapter:
+                mm_projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location='cpu')
+                embed_tokens_weight = mm_projector_weights['model.embed_tokens.weight']
+                assert num_new_tokens == 6  # start/end tokens for image/video/audio
                 if input_embeddings.shape == embed_tokens_weight.shape:
                     input_embeddings[-num_new_tokens:] = embed_tokens_weight[-num_new_tokens:]
                 elif embed_tokens_weight.shape[0] == num_new_tokens:

@@ -5,6 +5,7 @@ import torch
 import math
 import ast
 
+from decord import VideoReader, cpu
 from transformers import StoppingCriteria
 from llava.constants import *
 
@@ -181,7 +182,7 @@ def process_images(images, image_processor, model_cfg):
         new_images = torch.stack(new_images, dim=0)
     return new_images
 
-def process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAMES, image_grid=False, sample_scheme='uniform'):
+def process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAMES, sample_scheme='uniform'):
     def frame_sample(duration, mode='uniform', local_fps=None):
         if mode == 'uniform':
             # Calculate the size of each segment from which a frame will be extracted
@@ -205,59 +206,18 @@ def process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAM
         else:
             raise ImportError(f'Unsupported frame sampling mode: {mode}')
 
-    if isinstance(video_path, str):
-        if video_path.endswith('.gif'):
-            video_gif = imageio.get_reader(video_path)
-            duration, local_fps = len(video_gif), 10
+    
+    decord_vr = VideoReader(uri=video_path, ctx=cpu(0), num_threads=1) 
+    duration, local_fps = len(decord_vr), float(decord_vr.get_avg_fps())
 
-            frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
-            # limit the max input frames
-            if len(frame_id_list) > MAX_FRAMES:
-                frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
-            video_data = [frame for index, frame in enumerate(video_gif) if index in frame_id_list]
-        # added by lixin4ever, include the support of .webm files from sthsthv2
-        elif video_path.endswith('.webm'):
-            video_webm = VideoFileClip(video_path)
-            video_frames = np.array(list(video_webm.iter_frames()))
-
-            duration, local_fps = len(video_frames), video_webm.fps
-
-            frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
-            # limit the max input frames
-            if len(frame_id_list) > MAX_FRAMES:
-                frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
-            video_data = video_frames[frame_id_list]
-        else:
-            # NOTE: num_threads=1 is required to avoid deadlock in multiprocessing
-            decord_vr = VideoReader(uri=video_path, ctx=cpu(0), num_threads=1) 
-            duration, local_fps = len(decord_vr), float(decord_vr.get_avg_fps())
-        
-            frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
-            # limit the max input frames
-            if len(frame_id_list) > MAX_FRAMES:
-                frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
-            try:
-                video_data = decord_vr.get_batch(frame_id_list).numpy()
-            except:
-                video_data = decord_vr.get_batch(frame_id_list).asnumpy()
-
-            # if self.data_args.use_temp_aug:
-            #     frame_id_list = np.linspace(0, duration-1, num_frames * 2 * 2, dtype=int)
-            #     video_data = decord_vr.get_batch(frame_id_list)
-            #     video_frames = [Image.fromarray(f) for f in video_data.numpy()]
-            #     chunked_video_frames = chunk_list(video_frames, 2*2)
-            #     video_data = [frame_expansion(frame_list, 2) for frame_list in chunked_video_frames]
-    elif isinstance(video_path, np.ndarray):
-        assert len(video_path) == num_frames
-        video_data = video_path
-    elif isinstance(video_path, list):
-        assert len(video_path) == num_frames
-        video_data = np.stack([np.array(x) for x in video_path])
-
-    if image_grid:
-        grid_h = grid_w = math.ceil(math.sqrt(num_frames))
-        pg = create_photo_grid(video_data, grid_h, grid_w)
-        video_data = [pg, *video_data]
+    frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
+    # limit the max input frames
+    if len(frame_id_list) > MAX_FRAMES:
+        frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
+    try:
+        video_data = decord_vr.get_batch(frame_id_list).numpy()
+    except:
+        video_data = decord_vr.get_batch(frame_id_list).asnumpy()
 
     if aspect_ratio == 'pad':
         images = [Image.fromarray(f.numpy() if isinstance(f, torch.Tensor) else f) for f in video_data]
