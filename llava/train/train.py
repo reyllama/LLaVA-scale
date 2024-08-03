@@ -69,7 +69,7 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
     token_merging: bool = field(default=False)
     token_merging_s: int = field(default=2)
-    token_merging_r: float = field(default=0.5)
+    token_merging_r: float = field(default=0.25)
 
 
 @dataclass
