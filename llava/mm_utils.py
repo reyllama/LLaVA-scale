@@ -6,7 +6,7 @@ import math
 import ast
 
 from transformers import StoppingCriteria
-from llava.constants import IMAGE_TOKEN_INDEX
+from llava.constants import *
 
 
 def select_best_resolution(original_size, possible_resolutions):
@@ -181,6 +181,94 @@ def process_images(images, image_processor, model_cfg):
         new_images = torch.stack(new_images, dim=0)
     return new_images
 
+def process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAMES, image_grid=False, sample_scheme='uniform'):
+    def frame_sample(duration, mode='uniform', local_fps=None):
+        if mode == 'uniform':
+            # Calculate the size of each segment from which a frame will be extracted
+            seg_size = float(duration - 1) / num_frames
+
+            frame_ids = []
+            for i in range(num_frames):
+                # Calculate the start and end indices of each segment
+                start = int(np.round(seg_size * i))
+                end = int(np.round(seg_size * (i + 1)))
+                # Append the middle index of the segment to the list
+                frame_ids.append((start + end) // 2)
+
+            return frame_ids
+            # NOTE: old version
+            # return np.linspace(0, duration-1, num_frames, dtype=int)
+        elif mode == 'fps':
+            assert local_fps is not None
+            segment_len = min(local_fps // NUM_FRAMES_PER_SECOND, duration)
+            return np.arange(segment_len // 2, duration, segment_len, dtype=int)
+        else:
+            raise ImportError(f'Unsupported frame sampling mode: {mode}')
+
+    if isinstance(video_path, str):
+        if video_path.endswith('.gif'):
+            video_gif = imageio.get_reader(video_path)
+            duration, local_fps = len(video_gif), 10
+
+            frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
+            # limit the max input frames
+            if len(frame_id_list) > MAX_FRAMES:
+                frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
+            video_data = [frame for index, frame in enumerate(video_gif) if index in frame_id_list]
+        # added by lixin4ever, include the support of .webm files from sthsthv2
+        elif video_path.endswith('.webm'):
+            video_webm = VideoFileClip(video_path)
+            video_frames = np.array(list(video_webm.iter_frames()))
+
+            duration, local_fps = len(video_frames), video_webm.fps
+
+            frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
+            # limit the max input frames
+            if len(frame_id_list) > MAX_FRAMES:
+                frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
+            video_data = video_frames[frame_id_list]
+        else:
+            # NOTE: num_threads=1 is required to avoid deadlock in multiprocessing
+            decord_vr = VideoReader(uri=video_path, ctx=cpu(0), num_threads=1) 
+            duration, local_fps = len(decord_vr), float(decord_vr.get_avg_fps())
+        
+            frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
+            # limit the max input frames
+            if len(frame_id_list) > MAX_FRAMES:
+                frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
+            try:
+                video_data = decord_vr.get_batch(frame_id_list).numpy()
+            except:
+                video_data = decord_vr.get_batch(frame_id_list).asnumpy()
+
+            # if self.data_args.use_temp_aug:
+            #     frame_id_list = np.linspace(0, duration-1, num_frames * 2 * 2, dtype=int)
+            #     video_data = decord_vr.get_batch(frame_id_list)
+            #     video_frames = [Image.fromarray(f) for f in video_data.numpy()]
+            #     chunked_video_frames = chunk_list(video_frames, 2*2)
+            #     video_data = [frame_expansion(frame_list, 2) for frame_list in chunked_video_frames]
+    elif isinstance(video_path, np.ndarray):
+        assert len(video_path) == num_frames
+        video_data = video_path
+    elif isinstance(video_path, list):
+        assert len(video_path) == num_frames
+        video_data = np.stack([np.array(x) for x in video_path])
+
+    if image_grid:
+        grid_h = grid_w = math.ceil(math.sqrt(num_frames))
+        pg = create_photo_grid(video_data, grid_h, grid_w)
+        video_data = [pg, *video_data]
+
+    if aspect_ratio == 'pad':
+        images = [Image.fromarray(f.numpy() if isinstance(f, torch.Tensor) else f) for f in video_data]
+        images = [expand2square(image, tuple(int(x*255) for x in processor.image_mean)) for image in images]
+        video = processor.preprocess(images, return_tensors='pt')['pixel_values']
+    else:
+        images = [Image.fromarray(f.numpy() if isinstance(f, torch.Tensor) else f) for f in video_data]
+        video = processor.preprocess(images, return_tensors='pt')['pixel_values']
+
+    return video
+
 
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
@@ -203,6 +291,27 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
         raise ValueError(f'Unsupported tensor type: {return_tensors}')
     return input_ids
 
+def tokenizer_MMODAL_token(prompt, tokenizer, MMODAL_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
+    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split(f'<{MMODAL_INDEX_TOKEN[MMODAL_token_index].lower()}>')]
+    num_prompt_chunks = len(prompt.split(f'<{MMODAL_INDEX_TOKEN[MMODAL_token_index].lower()}>'))
+
+    def insert_separator(X, sep):
+        return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
+
+    input_ids = []
+    offset = 0
+    if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
+        offset = 1
+        input_ids.append(prompt_chunks[0][0])
+
+    for x in insert_separator(prompt_chunks, [MMODAL_token_index] * (offset + 1)):
+        input_ids.extend(x[offset:])
+
+    if return_tensors is not None:
+        if return_tensors == 'pt':
+            return torch.tensor(input_ids, dtype=torch.long)
+        raise ValueError(f'Unsupported tensor type: {return_tensors}')
+    return input_ids
 
 def get_model_name_from_path(model_path):
     model_path = model_path.strip("/")

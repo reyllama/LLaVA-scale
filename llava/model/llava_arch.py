@@ -97,7 +97,7 @@ class LlavaMetaModel:
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
         if getattr(model_args, 'token_merging', False):
-            from .token_merging import SDlikeTokenMerging
+            from .token_merging import LocalTokenMerging
             if "patch14" in model_args.vision_tower:
                 patch_size = 14
             elif "patch16" in model_args.vision_tower:
@@ -107,7 +107,7 @@ class LlavaMetaModel:
             sx = sy = model_args.token_merging_s
             r = model_args.token_merging_r
 
-            self.token_merging = SDlikeTokenMerging(
+            self.token_merging = LocalTokenMerging(
                 w=w, h=h, sx=sx, sy=sy, r=r
             )
 
@@ -224,15 +224,24 @@ class LlavaMetaForCausalLM(ABC):
         
         if hasattr(self.get_model(), "token_merging"):
             # print(f"Before merge: {image_features.size()}")
-            image_features = self.get_model().token_merging(image_features)
+            _image_features = self.get_model().token_merging(image_features)
             # print(f"After merge: {image_features.size()}")
 
-        # print(f"2/ image_features: {image_features.size()}") # batch, 256, 4096
-        
+        # print if rank == 0
+        if torch.distributed.get_rank() == 0:
+            # print(f"* image_features: {_image_features.size()}") # batch, 256, 4096
+            if _image_features.size(1) < 256:
+                pass
+                # print("before: ", image_features[0, :5].data)
+                # print("after: ", _image_features[0, :5].data)
+
+        image_features = _image_features
+
         # Let's just add dummy tensors if they do not exist,
         # it is a headache to deal with None all the time.
         # But it is not ideal, and if you have a better idea,
         # please open an issue / submit a PR, thanks.
+    
         _labels = labels
         _position_ids = position_ids
         _attention_mask = attention_mask
@@ -290,6 +299,13 @@ class LlavaMetaForCausalLM(ABC):
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
             cur_new_labels = torch.cat(cur_new_labels)
+
+            # if cur_image_features.shape[0] < 256:
+            #     if torch.distributed.get_rank() == 0:
+            #         print(f"* cur_image_features: {cur_image_features.size()}")
+            #         print(f"* cur_new_input_embeds: {cur_new_input_embeds.size()}")
+            #         print(f"* cur_new_labels: {cur_new_labels.size()}")
+
 
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
