@@ -29,13 +29,13 @@ from torch.utils.data import Dataset
 import transformers
 import tokenizers
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import NUM_FRAMES, IGNORE_INDEX, MMODAL_TOKEN_INDEX, DEFAULT_MMODAL_TOKEN, DEFAULT_MMODAL_START_TOKEN, DEFAULT_MMODAL_END_TOKEN, DEFAULT_IMAGE_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
-from llava.mm_utils import tokenizer_image_token
+from llava.mm_utils import tokenizer_image_token, tokenizer_MMODAL_token
 # from llava.webdataset import *
 
 from PIL import Image
@@ -315,30 +315,29 @@ def _add_speaker_and_signal(header, source, get_conversation=True):
     conversation += BEGIN_SIGNAL
     return conversation
 
-
-def preprocess_multimodal(
-    sources: Sequence[str],
-    data_args: DataArguments
-) -> Dict:
+def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> Dict:
     is_multimodal = data_args.is_multimodal
     if not is_multimodal:
         return sources
 
     for source in sources:
         for sentence in source:
-            if DEFAULT_IMAGE_TOKEN in sentence['value']:
-                sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
-                sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']
-                sentence['value'] = sentence['value'].strip()
-                if "mmtag" in conversation_lib.default_conversation.version:
-                    sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '<Image>' + DEFAULT_IMAGE_TOKEN + '</Image>')
-            replace_token = DEFAULT_IMAGE_TOKEN
-            if data_args.mm_use_im_start_end:
-                replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
-            sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+            # NOTE: scan token of each modal and move them to the beginning of the sentence. 
+            for DEFAULT_TOKEN in DEFAULT_MMODAL_TOKEN.values():
+                MODAL_TYPE = None
+                if DEFAULT_TOKEN in sentence['value']:
+                    MODAL_TYPE = DEFAULT_TOKEN[1:-1]
+                    sentence['value'] = sentence['value'].replace(DEFAULT_TOKEN, '').strip()
+                    sentence['value'] = DEFAULT_TOKEN + '\n' + sentence['value']
+                    sentence['value'] = sentence['value'].strip()
+                    if "mmtag" in conversation_lib.default_conversation.version:
+                        sentence['value'] = sentence['value'].replace(DEFAULT_TOKEN, f'<{MODAL_TYPE.capitalize()}>' + DEFAULT_TOKEN + f'</{MODAL_TYPE.capitalize()}>')
+                replace_token = DEFAULT_TOKEN
+                if data_args.mm_use_im_start_end and MODAL_TYPE is not None:
+                    replace_token = DEFAULT_MMODAL_START_TOKEN[MODAL_TYPE.upper()] + replace_token + DEFAULT_MMODAL_START_TOKEN[MODAL_TYPE.upper()]
+                sentence["value"] = sentence["value"].replace(DEFAULT_TOKEN, replace_token)
 
     return sources
-
 
 def preprocess_llama_2(
     sources,
@@ -599,29 +598,37 @@ def preprocess_mpt(
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
+    modal_list: Optional[Sequence[str]] = [],
 ) -> Dict:
     # add end signal and concatenate together
     conversations = []
     for source in sources:
-        assert len(source) == 2
-        assert DEFAULT_IMAGE_TOKEN in source[0]['value']
-        source[0]['value'] = DEFAULT_IMAGE_TOKEN
+        assert len(source) == 2 # [{'from': 'human', 'value': '<image>\nSummarize the visual content of the image.'}, {'from': 'gpt', 'value': 'professional artists brushes, white bottles and tubes'}]
+        mmodal_token = "".join([DEFAULT_MMODAL_TOKEN[modal] for modal in modal_list])
+        source[0]['value'] = mmodal_token
         conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep
         conversations.append(conversation)
     # tokenize conversations
-    input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+
+    # TODO : more than one modality token can be present
+    # rank0_print(f"+ mmodal_token: {mmodal_token}")
+    # rank0_print(f"+ conversations here: {conversations}")
+    input_ids = [tokenizer_MMODAL_token(prompt, tokenizer, mmodal_token, modal_list, return_tensors='pt') for prompt in conversations]
+    # rank0_print(f"+ input_ids here: {input_ids}")
     targets = copy.deepcopy(input_ids)
     for target, source in zip(targets, sources):
-        tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))
+        tokenized_len = len(tokenizer_MMODAL_token(source[0]['value'], tokenizer, mmodal_token, modal_list))
         target[:tokenized_len] = IGNORE_INDEX
-
+    # rank0_print(f"+ targets here: {targets}")
+    
     return dict(input_ids=input_ids, labels=targets)
 
 
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
+    modal_list: Optional[Sequence[str]] = [], # TODO
+    has_image: bool = False,
 ) -> Dict:
     """
     Given a list of sources, each is a conversation list. This transform:
@@ -631,7 +638,7 @@ def preprocess(
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
-        return preprocess_plain(sources, tokenizer)
+        return preprocess_plain(sources, tokenizer, modal_list) # HERE
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version.startswith("v1"):
@@ -818,32 +825,53 @@ class WebDataset(Dataset):
             .map(self.decode_sample)
         )
         self.iterator = iter(self.dataset)
+        self.modals = ["image", "video", "audio"]
 
     def decode_sample(self, sample):
-        image = sample["jpg"]
+
         metadata = sample['json']
         conversations = metadata["conversations"]
+        decoded_sample = dict()
+        modal_list = list()
 
-        # Process image
-        if self.data_args.image_aspect_ratio == 'pad':
-            def expand2square(pil_img, background_color):
-                width, height = pil_img.size
-                if width == height:
-                    return pil_img
-                elif width > height:
-                    result = Image.new(pil_img.mode, (width, width), background_color)
-                    result.paste(pil_img, (0, (width - height) // 2))
-                    return result
-                else:
-                    result = Image.new(pil_img.mode, (height, height), background_color)
-                    result.paste(pil_img, ((height - width) // 2, 0))
-                    return result
-            image = expand2square(image, tuple(int(x * 255) for x in self.data_args.image_processor.image_mean))
-            image = self.data_args.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-        else:
-            image = self.data_args.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        if 'jpg' in sample:
+            image = sample["jpg"]
+            if self.data_args.image_aspect_ratio == 'pad':
+                def expand2square(pil_img, background_color):
+                    width, height = pil_img.size
+                    if width == height:
+                        return pil_img
+                    elif width > height:
+                        result = Image.new(pil_img.mode, (width, width), background_color)
+                        result.paste(pil_img, (0, (width - height) // 2))
+                        return result
+                    else:
+                        result = Image.new(pil_img.mode, (height, height), background_color)
+                        result.paste(pil_img, ((height - width) // 2, 0))
+                        return result
+                image = expand2square(image, tuple(int(x * 255) for x in self.data_args.image_processor.image_mean))
+                image = self.data_args.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            else:
+                image = self.data_args.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            decoded_sample["image"] = image
+            modal_list.append('IMAGE')
+        
+        if 'mp4' in sample:
+            video = sample["mp4"]
+            video = self.process_video(video)
+            decoded_sample["video"] = video
+            modal_list.append('VIDEO')
 
-        return {"image": image, "conversations": conversations}
+        if 'mp3' in sample:
+            audio = sample["mp3"]
+            audio = self.process_audio(audio)
+            decoded_sample["audio"] = audio
+            modal_list.append('AUDIO')
+
+        decoded_sample['conversations'] = conversations
+        decoded_sample['modal_list'] = modal_list
+
+        return decoded_sample
 
     def __len__(self):
         return self.est_len
@@ -855,10 +883,12 @@ class WebDataset(Dataset):
             self.iterator = iter(self.dataset)
             sample = next(self.iterator)
         conversations = preprocess_multimodal(copy.deepcopy([sample["conversations"]]), self.data_args)
-        data_dict = preprocess(conversations, self.tokenizer, has_image=True)
+        data_dict = preprocess(conversations, self.tokenizer, sample['modal_list']) # TODO
         data_dict = dict(input_ids=data_dict["input_ids"][0],
                         labels=data_dict["labels"][0])
-        data_dict["image"] = sample["image"]
+        for modal in self.modals:
+            if modal in sample:
+                data_dict[modal] = sample[modal]
         return data_dict
 
 

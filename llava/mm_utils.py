@@ -273,6 +273,9 @@ def process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAM
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
 
+    # if torch.distributed.get_rank() == 0:
+    #     print(f"prompt_chunks: {prompt_chunks}")
+
     def insert_separator(X, sep):
         return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
 
@@ -281,6 +284,10 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
     if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
         offset = 1
         input_ids.append(prompt_chunks[0][0])
+
+    # if torch.distributed.get_rank() == 0:
+    #     print(f"Offset: {offset}")
+    #     print(f"Insert seperator: {insert_separator(prompt_chunks, [image_token_index] * (offset + 1))}")
 
     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])
@@ -291,26 +298,30 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
         raise ValueError(f'Unsupported tensor type: {return_tensors}')
     return input_ids
 
-def tokenizer_MMODAL_token(prompt, tokenizer, MMODAL_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
-    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split(f'<{MMODAL_INDEX_TOKEN[MMODAL_token_index].lower()}>')]
-    num_prompt_chunks = len(prompt.split(f'<{MMODAL_INDEX_TOKEN[MMODAL_token_index].lower()}>'))
-
+def tokenizer_MMODAL_token(prompt, tokenizer, mmodal_token, modals=[], return_tensors=None):
+    
     def insert_separator(X, sep):
         return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
 
     input_ids = []
     offset = 0
+
+    mmodal_token_indices = [MMODAL_TOKEN_INDEX[modal] for modal in modals]
+
+    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split(mmodal_token)]
+
     if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
         offset = 1
         input_ids.append(prompt_chunks[0][0])
 
-    for x in insert_separator(prompt_chunks, [MMODAL_token_index] * (offset + 1)):
+    for x in insert_separator(prompt_chunks, [None]+mmodal_token_indices):
         input_ids.extend(x[offset:])
 
     if return_tensors is not None:
         if return_tensors == 'pt':
             return torch.tensor(input_ids, dtype=torch.long)
         raise ValueError(f'Unsupported tensor type: {return_tensors}')
+
     return input_ids
 
 def get_model_name_from_path(model_path):
