@@ -155,7 +155,6 @@ class DataCollatorForWebDataset(object):
         for modal in ['image', 'video', 'audio']:
             if modal in instances[0]:
                 modal_data = [instance[modal] for instance in instances]
-                # print(f"modal: {modal}, modal_data: {modal_data}")
                 if all(x is not None and x.shape == modal_data[0].shape for x in modal_data):
                     batch[f"{modal}s"] = torch.stack(modal_data)
                 else:

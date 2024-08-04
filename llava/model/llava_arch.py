@@ -203,14 +203,6 @@ class LlavaMetaForCausalLM(ABC):
             features = self.get_model().mm_projector(features)
         return features
 
-    # def encode_videos(self, videos):
-    #     assert videos.ndim == 5, f"Expected 5D tensor, got {videos.ndim}D tensor."
-    #     b, n, c, h, w = videos.shape
-    #     videos = videos.view(b * n, c, h, w)
-    #     video_features = self.get_model().get_vision_tower()(videos)
-    #     video_features = self.get_model().mm_projector(video_features)
-    #     return video_features.reshape(b, n, c, h, w)
-
     def encode_audio(self, audio):
         audio = audio.to(dtype=torch.float16)
         padding = torch.zeros_like(audio).bool()

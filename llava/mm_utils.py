@@ -233,9 +233,6 @@ def process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAM
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
     prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
 
-    # if torch.distributed.get_rank() == 0:
-    #     print(f"prompt_chunks: {prompt_chunks}")
-
     def insert_separator(X, sep):
         return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
 
@@ -244,10 +241,6 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
     if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
         offset = 1
         input_ids.append(prompt_chunks[0][0])
-
-    # if torch.distributed.get_rank() == 0:
-    #     print(f"Offset: {offset}")
-    #     print(f"Insert seperator: {insert_separator(prompt_chunks, [image_token_index] * (offset + 1))}")
 
     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])

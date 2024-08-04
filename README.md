@@ -22,7 +22,7 @@
 
 [Webdataset](https://webdataset.github.io/webdataset/) is a pytorch implementation of [IterableDataset](https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset) that provides efficient access to dataset stored in `.tar` archives in streaming fashion. It has advantages over classical map-based dataset in terms of scalability as it naturally supports `streaming` and `sharding`, relieving potential memory/communication bottlenecks.
 
-Webdataset class is implemented in [webdataset.py](). Thanks to the flexible mapping supported by webdatasets, we can take care of the basic preprocessing of the audio-visual input using the `decode_sample()` method.
+Webdataset class is implemented in [webdataset.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/dataset/webdataset.py). Thanks to the flexible mapping supported by webdatasets, we can take care of the basic preprocessing of the audio-visual input using the `decode_sample()` method.
 
 ```python
     def decode_sample(self, sample):
@@ -66,7 +66,7 @@ Webdataset class is implemented in [webdataset.py](). Thanks to the flexible map
         return decoded_sample
 ```
 
-Because we already have the 558k dataset locally, we convert them to `.tar` archive format to use webdataset pipeline. This code is provided in [convert_data_to_wds.py]().
+Because we already have the 558k dataset locally, we convert them to `.tar` archive format to use webdataset pipeline. This code is provided in [convert_data_to_wds.py](https://github.com/reyllama/LLaVA-scale/blob/main/scripts/convert_data_to_wds.py).
 
 ```python
 def create_sharded_tars_image(json_file, image_dir, output_dir, shard_size=1000):
@@ -111,6 +111,8 @@ The training logs for base (original) and webdataset pipeline are shown below.
 - ToMe-SD (Token Merging for SD) introduces a window-based anchor selection method (window size of 2x2) to adapt token merging to the dense prediction task (image generation).
 - We modify ToMe-SD to preserve relative order of the visual tokens. Although the original ToMe-SD did not care so much about the sequence order (because older SDs do not embed position information anyways), for our task, the relative position order of visual tokens is crucial.
 - We introduce cosine scheduling for the token merging ratio `r` (proportion of tokens to merge). We observe training instability otherwise.
+
+Following is the implementation of `LocalTokenMerging`. Full code can be found at [token_merging.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/model/token_merging.py).
 
 ```python
 class LocalTokenMerging:
@@ -196,10 +198,311 @@ The training logs for different Token Merging methods are shown below. (Green: b
 
 ### \# 2-3. Instruction-aware Spatio-temporal Resampling
 
-When we deal with high-resolution data (both spatial and temporal), naive prepending approach of LLaVA results in excess number of visual tokens fed to the language model. To overcome this limitation, several works have proposed resampling techniques to handle language modeling on (long) videos. [BLIP2](https://arxiv.org/abs/2301.12597) and [InstructBLIP](https://arxiv.org/abs/2305.06500), for instance, introduce Q-former to extract instruction-aware visual information from the input. However, [a recent work](https://arxiv.org/abs/2406.07476) has pointed out that its naive resampling hurts video understanding capability by ignoring the spatio-temporal order of audio-visual tokens. 
+When we deal with high-resolution data (both spatial and temporal), naive prepending approach of LLaVA results in excess number of visual tokens fed to the language model. To overcome this limitation, several works have proposed resampling techniques to handle language modeling on (long) videos. [BLIP2](https://arxiv.org/abs/2301.12597) and [InstructBLIP](https://arxiv.org/abs/2305.06500), for instance, introduce Q-former to extract instruction-aware visual information from the input. However, [a recent work](https://arxiv.org/abs/2406.07476) has pointed out that its naive resampling hurts video understanding capability by ignoring the spatio-temporal order of audio-visual tokens. Also, it is not straightforward to incorporate instruction-aware Q-former to LLaVA, as language input is later directly fed to the language model. To handle these problems, we make the following modiifcations:
+
+- We add CLIP text model to embed the instruction ('human' part of the conversation). This module is highly lightweight compared to the language model, adding negligible compute overhead.
+- We implement instruction-aware Q-former layer, which leverages the instruction to decide *which information to extract* from the visual tokens.
+- We apply [sliding window attention](https://arxiv.org/abs/2103.14030) against the visual tokens to preserve relative spatio-temporal order of the input even after resampling. Note that as the output query embeddings are position-aware (by the language model), this design choice successfully propagates the spatio-temporal order of the input tokens to the final output.
+
+[clip_encoder.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/model/multimodal_encoder/clip_encoder.py#L150) has the CLIP text model implementation.
+
+Instruction-aware SwinQFormer is implemented in [multimodal_projector/builder.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/model/multimodal_projector/builder.py) as a multimodal projector. Key components of the implementation are shown below:
+
+```python
+
+def split_tensor(tensor, n, w):
+
+    '''
+        Reshape (b,m,d) tensor into (b,n,w,d) tensor (with overlapping windows) 
+    '''
+
+    tensor_length = tensor.size(1)
+    subarrays = []
+    
+    step = max(1, (tensor_length - w) // (n - 1))
+    
+    for i in range(n):
+        start_index = i * step
+        end_index = start_index + w
+        if end_index > tensor_length:
+            start_index = tensor_length - w
+            end_index = tensor_length
+        subarray = tensor[:, start_index:end_index]
+        subarrays.append(subarray)
+    
+    out_tensor = torch.stack(subarrays).transpose(0, 1)
+
+    return out_tensor
+
+
+class SwinQFormer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        self.instruction_tower = CLIPTextTower(getattr(config, 'instruction_tower', 'openai/clip-vit-large-patch14'), 
+                                          config)
+        self.instruction_tower.load_model()
+        self.inst_projection = nn.Linear(config.instruction_hidden_size, config.hidden_size)
+        self.Queries = nn.Parameter(torch.randn(1, config.num_queries, config.hidden_size)) # TODO
+        self.norm = nn.LayerNorm(config.hidden_size)
+        self.to_kv_inst = nn.Linear(config.hidden_size, config.hidden_size * 2)
+        self.to_out_inst = nn.Linear(config.hidden_size, config.hidden_size)
+        self.to_kv_mmodal = nn.Linear(config.mmodal_hidden_size, config.hidden_size * 2)
+        self.to_out_mmodal = nn.Linear(config.hidden_size, config.hidden_size)
+        self.window_size = getattr(config, 'window_size', 512)
+
+    def apply_swin_attention(self, q, k, v):
+        
+        b, n, d = q.shape
+        k = split_tensor(k, n, self.window_size)
+        v = split_tensor(v, n, self.window_size)
+
+        attn = torch.einsum('b n d, b n w d -> b n w', q, k)
+        attn = attn / (k.shape[-1] ** 0.5)
+        attn = attn - attn.amax(dim=-1, keepdim=True)
+        attn = attn.softmax(dim=-1)
+        out = torch.einsum('b n w, b n w d -> b n d', attn, v)
+        
+        return out
+
+    def forward(self, x_mmodal: torch.Tensor, x_inst: torch.Tensor):
+
+        inst_feats = self.instruction_tower(x_inst)
+        b, n, _ = inst_feats.shape
+        inst_feats = self.inst_projection(inst_feats)
+        k, v = self.to_kv_inst(inst_feats).chunk(2, dim=-1)
+        k, v = self.norm(k), self.norm(v)
+        q = self.Queries.expand(b, -1, -1)
+        q = self.apply_attention(q, k, v)
+        q = self.to_out_inst(q)
+        q = self.norm(q)
+        k, v = self.to_kv_mmodal(x_mmodal).chunk(2, dim=-1)
+        k, v = self.norm(k), self.norm(v)
+        out = self.apply_swin_attention(q, k, v)
+        out = self.to_out_mmodal(out)
+        return self.norm(out)
+```
+
+Training with `num_queries=64` results in acclerated convergence.
+
+![Qformer](./assets/qf.jpg)
 
 ## 🎯 Video + Audio Utilization
 
 ### \# 3-1. Video
 
+Video input is naturally supported in the original LLaVA codebase. Using image feature extractor like CLIP ViT is a reasonable choice for encoding visual information, hence we stick to it. We have suggested two methods to improve efficiencies (token merging and instruction-aware resampling) to control the compute burden of video data. We include core code snippets below.
+
+[preprocessing.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/dataset/preprocessing.py)
+
+```python
+def _process_video(video_path, processor, aspect_ratio='pad', num_frames=NUM_FRAMES, sample_scheme='uniform'):
+    def frame_sample(duration, mode='uniform', local_fps=None):
+        if mode == 'uniform':
+            # Calculate the size of each segment from which a frame will be extracted
+            seg_size = float(duration - 1) / num_frames
+
+            frame_ids = []
+            for i in range(num_frames):
+                # Calculate the start and end indices of each segment
+                start = int(np.round(seg_size * i))
+                end = int(np.round(seg_size * (i + 1)))
+                # Append the middle index of the segment to the list
+                frame_ids.append((start + end) // 2)
+
+            return frame_ids
+            # NOTE: old version
+            # return np.linspace(0, duration-1, num_frames, dtype=int)
+        elif mode == 'fps':
+            assert local_fps is not None
+            segment_len = min(local_fps // NUM_FRAMES_PER_SECOND, duration)
+            return np.arange(segment_len // 2, duration, segment_len, dtype=int)
+        else:
+            raise ImportError(f'Unsupported frame sampling mode: {mode}')
+
+    
+    decord_vr = VideoReader(uri=video_path, ctx=cpu(0), num_threads=1) 
+    duration, local_fps = len(decord_vr), float(decord_vr.get_avg_fps())
+
+    frame_id_list = frame_sample(duration, mode=sample_scheme, local_fps=local_fps)
+    # limit the max input frames
+    if len(frame_id_list) > MAX_FRAMES:
+        frame_id_list = np.linspace(0, duration-1, MAX_FRAMES, dtype=int)
+    try:
+        video_data = decord_vr.get_batch(frame_id_list).numpy()
+    except:
+        video_data = decord_vr.get_batch(frame_id_list).asnumpy()
+
+    if aspect_ratio == 'pad':
+        images = [Image.fromarray(f.numpy() if isinstance(f, torch.Tensor) else f) for f in video_data]
+        images = [expand2square(image, tuple(int(x*255) for x in processor.image_mean)) for image in images]
+        video = processor.preprocess(images, return_tensors='pt')['pixel_values']
+    else:
+        images = [Image.fromarray(f.numpy() if isinstance(f, torch.Tensor) else f) for f in video_data]
+        video = processor.preprocess(images, return_tensors='pt')['pixel_values']
+
+    return video
+```
+
+[webdataset.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/dataset/webdataset.py)
+
+```python
+@dataclass
+class DataCollatorForWebDataset(object):
+    """Collate examples for supervised fine-tuning using webdataset."""
+
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        input_ids, labels = tuple([instance[key] for instance in instances]
+                                  for key in ("input_ids", "labels"))
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id)
+        labels = torch.nn.utils.rnn.pad_sequence(labels,
+                                                 batch_first=True,
+                                                 padding_value=IGNORE_INDEX)
+        input_ids = input_ids[:, :self.tokenizer.model_max_length]
+        labels = labels[:, :self.tokenizer.model_max_length]
+        batch = dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+
+        for modal in ['image', 'video', 'audio']:
+            if modal in instances[0]:
+                modal_data = [instance[modal] for instance in instances]
+                # print(f"modal: {modal}, modal_data: {modal_data}")
+                if all(x is not None and x.shape == modal_data[0].shape for x in modal_data):
+                    batch[f"{modal}s"] = torch.stack(modal_data)
+                else:
+                    batch[f"{modal}s"] = modal_data
+
+        batch['instructions'] = [instance['instructions'] for instance in instances]
+
+        return batch
+```
+
 ### \# 3-2. Audio
+
+We add a separate audio tower like [VideoLLaMA-2](https://github.com/DAMO-NLP-SG/VideoLLaMA2). We use the pretrained [BEATs](https://github.com/microsoft/unilm/tree/master/beats) model to extract audio features and add projection for modality alignment. We append the audio tokens to the visual tokens for the language model to process. Core code snippets are shown below.
+
+[multimodal_encoder/builder.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/model/multimodal_encoder/builder.py)
+
+```python
+from .BEATs.BEATs import BEATs, BEATsConfig
+
+def build_audio_tower(audio_tower_cfg, **kwargs):
+    audio_tower = getattr(audio_tower_cfg, 'mm_audio_tower', getattr(audio_tower_cfg, 'audio_tower', None))
+    checkpoint = torch.load(audio_tower)
+
+    cfg = BEATsConfig(checkpoint['cfg'])
+    BEATs_model = BEATs(cfg)
+    BEATs_model.load_state_dict(checkpoint['model'])
+    BEATs_model.eval()
+    BEATs_model.hidden_size = audio_tower_cfg.audio_hidden_size
+
+    return BEATs_model
+```
+
+[llava_arch.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/model/llava_arch.py#L55)
+
+```python
+class LlavaMetaModel:
+
+    def initialize_audio_modules(self, model_args, fsdp=None):
+        
+        audio_tower = model_args.audio_tower # TODO
+        
+        self.config.mm_audio_tower = audio_tower
+
+        if self.get_audio_tower() is None:
+            audio_tower = build_audio_tower(model_args)
+
+            if fsdp is not None and len(fsdp) > 0:
+                self.audio_tower = [audio_tower]
+            else:
+                self.audio_tower = audio_tower
+        else:
+            if fsdp is not None and len(fsdp) > 0:
+                audio_tower = self.audio_tower[0]
+            else:
+                audio_tower = self.audio_tower
+        
+        self.config.use_audio_proj = True
+        self.config.audio_projector_type = getattr(model_args, 'audio_projector_type', 'linear')
+        self.config.audio_hidden_size = getattr(model_args, 'audio_hidden_size', audio_tower.hidden_size)
+
+        if getattr(self, 'audio_projector', None) is None:
+            self.audio_projector = build_projector(self.config, projector_name_type='audio_projector_type')
+
+        else:
+            for p in self.audio_projector.parameters():
+                p.requires_grad = True
+
+
+class LlavaMetaForCausalLM(ABC):
+
+    def encode_images(self, images):
+        image_features = self.get_model().get_vision_tower()(images)
+        image_features = self.get_model().mm_projector(image_features)
+        return image_features
+
+    def encode_mmodal(self, mmodal, instruction):
+        features = self.get_model().get_vision_tower()(mmodal)
+        if self.get_model().config.mm_projector_type == 'swinqformer':
+            features = self.get_model().mm_projector(features, instruction)
+        else:
+            features = self.get_model().mm_projector(features)
+        return features
+
+    def encode_audio(self, audio):
+        audio = audio.to(dtype=torch.float16)
+        padding = torch.zeros_like(audio).bool()
+        audio_features = self.get_model().get_audio_tower().to(dtype=torch.float16).extract_features(audio, padding)[0]
+        audio_features = self.get_model().audio_projector.to(dtype=torch.float16)(audio_features)
+        return audio_features.to(dtype=torch.bfloat16)
+```
+
+[mm_utils.py](https://github.com/reyllama/LLaVA-scale/blob/main/llava/mm_utils.py#L261)
+
+```python
+def tokenizer_MMODAL_token(prompt, tokenizer, mmodal_token, modals=[], return_tensors=None):
+    
+    def insert_separator(X, sep):
+        return [ele for sublist in zip(X, [sep]*len(X)) for ele in sublist][:-1]
+
+    input_ids = []
+    offset = 0
+
+    mmodal_token_indices = [MMODAL_TOKEN_INDEX[modal] for modal in modals]
+
+    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split(mmodal_token)]
+
+    if len(prompt_chunks) > 0 and len(prompt_chunks[0]) > 0 and prompt_chunks[0][0] == tokenizer.bos_token_id:
+        offset = 1
+        input_ids.append(prompt_chunks[0][0])
+
+    for x in insert_separator(prompt_chunks, [None]+mmodal_token_indices):
+        input_ids.extend(x[offset:])
+
+    if return_tensors is not None:
+        if return_tensors == 'pt':
+            return torch.tensor(input_ids, dtype=torch.long)
+        raise ValueError(f'Unsupported tensor type: {return_tensors}')
+
+    return input_ids
+```
+
+Finally, placeholder code for video and audio data are inserted to run video/audio training.
+
+[placeholder1](https://github.com/reyllama/LLaVA-scale/blob/main/llava/dataset/webdataset.py#L34)  |  [placeholder2](https://github.com/reyllama/LLaVA-scale/blob/main/llava/dataset/webdataset.py#L92)
+
+To run the code yourself, run
+
+```
+$ bash scripts/pretrain_tome.sh # run Token Merging
+$ bash scripts/pretrain_qformer.sh # run instruction-aware Q-former
+```

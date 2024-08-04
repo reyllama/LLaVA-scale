@@ -95,11 +95,8 @@ class SwinQFormer(nn.Module):
 
     def forward(self, x_mmodal: torch.Tensor, x_inst: torch.Tensor):
 
-        # print(f"x_mmodal: {x_mmodal.shape}") # (batch, 256, 1024)
-
         inst_feats = self.instruction_tower(x_inst)
         b, n, _ = inst_feats.shape
-        # print(f"inst_feats: {inst_feats.shape}") # (batch, n, 768)
         inst_feats = self.inst_projection(inst_feats)
         k, v = self.to_kv_inst(inst_feats).chunk(2, dim=-1)
         k, v = self.norm(k), self.norm(v)
