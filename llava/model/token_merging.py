@@ -17,8 +17,9 @@ class LocalTokenMerging:
             print(f"[ToMe] Initializing Local Token Merging with w: {w}, h: {h}, sx: {sx}, sy: {sy}, r: {r}")
 
     def adjust_r(self):
-        self.r = self.max_r * (1 - math.cos((self.tik / 4000) * math.pi / 2)) if self.tik < 4000 else self.max_r
-        
+        # self.r = self.max_r * (1 - math.cos((self.tik / 4000) * math.pi / 2)) if self.tik < 4000 else self.max_r
+        self.r = self.max_r
+
     def __call__(self, x: torch.Tensor):
         B, N, C = x.shape
         r = int(self.r * N)
