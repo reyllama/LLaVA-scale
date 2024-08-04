@@ -10,7 +10,6 @@ import transformers
 import webdataset as wds
 from typing import Dict, Sequence, Tuple, Union
 from .preprocessing import preprocess, preprocess_multimodal, _process_video
-from .utils import count_shards
 from ..constants import IGNORE_INDEX
 
 class WebDataset(Dataset):
@@ -165,3 +164,7 @@ class DataCollatorForWebDataset(object):
         batch['instructions'] = [instance['instructions'] for instance in instances]
 
         return batch
+
+def count_shards(shard_pattern: str) -> int:
+    shard_files = glob.glob(shard_pattern.replace("{00000..00558}", "*"))
+    return len(shard_files)

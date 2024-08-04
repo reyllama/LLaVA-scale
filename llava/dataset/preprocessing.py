@@ -7,7 +7,8 @@ from typing import Dict, Optional, Sequence
 from decord import VideoReader, cpu
 
 from ..constants import *
-from ..llava import conversation as conversation_lib
+from .. import conversation as conversation_lib
+from ..mm_utils import tokenizer_image_token, tokenizer_MMODAL_token
 
 def preprocess_multimodal(sources, data_args) -> Dict:
     is_multimodal = data_args.is_multimodal

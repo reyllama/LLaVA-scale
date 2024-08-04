@@ -17,9 +17,8 @@ class LocalTokenMerging:
             print(f"[ToMe] Initializing Local Token Merging with w: {w}, h: {h}, sx: {sx}, sy: {sy}, r: {r}")
 
     def adjust_r(self):
-        # self.r = self.max_r * (1 - math.cos((self.tik / 4000) * math.pi / 2)) if self.tik < 4000 else self.max_r
-        self.r = self.max_r
-
+        self.r = self.max_r * (1 - math.cos((self.tik / 4000) * math.pi / 2)) if self.tik < 4000 else self.max_r
+        
     def __call__(self, x: torch.Tensor):
         B, N, C = x.shape
         r = int(self.r * N)
@@ -73,49 +72,15 @@ class LocalTokenMerging:
             node_max, node_idx = scores.max(dim=-1)
             edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
-            # unm_idx = edge_idx[..., r:, :]
             src_idx = edge_idx[..., :r, :]
-            # dst_idx = gather(node_idx[..., None], dim=-2, index=src_idx)
-            # if torch.distributed.get_rank() == 0:
-            #     print(f"** [ToMe] r: {r}")
-            #     print(f"** [ToMe] unm_idx.shape: {unm_idx.shape}, src_idx.shape: {src_idx.shape}, dst_idx.shape: {dst_idx.shape}")
-            #     print(f"** [ToMe] unm_idx: {unm_idx[0,:,0]}, src_idx: {src_idx[0,:,0]}, dst_idx: {dst_idx[0,:,0]}")
-
 
             mask = torch.ones(B, N, dtype=torch.bool, device=x.device)
             for b in range(B):
                 mask[b, src_idx[b, :, 0]] = False
             out = x[mask].view(B, N - r, -1)
 
-            return out
+        return out
 
-            # n, t1, c = a.shape
-
-            # unm = gather(a, dim=-2, index=unm_idx.expand(n, t1 - r, c))
-            # src = gather(a, dim=-2, index=src_idx.expand(n, r, c))
-            # dst = b.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce="mean")
-
-            # original_indices = torch.arange(N, device=x.device).reshape(1, N, 1).expand(B, N, 1)
-            # unm_indices = gather(original_indices, dim=1, index=unm_idx.expand(B, t1 - r, 1))
-            # dst_indices = gather(original_indices, dim=1, index=b_idx.expand(B, num_dst, 1))
-            # if torch.distributed.get_rank() == 0:
-            #     print(f"** [ToMe] unm_indices.shape: {unm_indices.shape}, dst_indices.shape: {dst_indices.shape}")
-            #     print(f"** [ToMe] unm_indices: {unm_indices[0,:,0]}, dst_indices: {dst_indices[0,:,0]}")
-
-            # new_indices = torch.cat([unm_indices, dst_indices], dim=1)
-            # new_tokens = torch.cat([unm, dst], dim=1)
-            # if torch.distributed.get_rank() == 0:
-            #     print(f"** [ToMe] new_indices.shape: {new_indices.shape}, new_tokens.shape: {new_tokens.shape}")
-            #     print(f"** [ToMe] new_indices: {new_indices[0,:,0]}")
-
-            # # Sort by the original indices to maintain relative order
-            # sorted_indices = new_indices.argsort(dim=1)
-            # if torch.distributed.get_rank() == 0:
-            #     print(f"** [ToMe] sorted_indices.shape: {sorted_indices.shape}")
-            #     print(f"** [ToMe] sorted_indices: {sorted_indices[0,:,0]}")
-            # result = gather(new_tokens, dim=1, index=sorted_indices.expand(B, N - r, C))
-
-        return result
 
 def mps_gather_workaround(input, dim, index):
     if input.shape[-1] == 1:
