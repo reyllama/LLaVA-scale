@@ -74,6 +74,9 @@ class ModelArguments:
     audio_tower: Optional[str] = field(default=None)
     audio_hidden_size: Optional[int] = field(default=768)
     tune_audio_mlp_adapter: bool = field(default=False)
+    num_queries: Optional[int] = field(default=128)
+    instruction_hidden_size: Optional[int] = field(default=512)
+
 
 
 @dataclass
@@ -607,12 +610,15 @@ def preprocess_plain(
     modal_list: Optional[Sequence[str]] = [],
 ) -> Dict:
     # add end signal and concatenate together
+    instructions = []
     conversations = []
     for source in sources:
         assert len(source) == 2 # [{'from': 'human', 'value': '<image>\nSummarize the visual content of the image.'}, {'from': 'gpt', 'value': 'professional artists brushes, white bottles and tubes'}]
+        instruction = source[0]['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
         mmodal_token = "".join([DEFAULT_MMODAL_TOKEN[modal] for modal in modal_list])
         source[0]['value'] = mmodal_token
         conversation = source[0]['value'] + source[1]['value'] + conversation_lib.default_conversation.sep
+        instructions.append(instruction)
         conversations.append(conversation)
     # tokenize conversations
 
@@ -627,7 +633,7 @@ def preprocess_plain(
         target[:tokenized_len] = IGNORE_INDEX
     # rank0_print(f"+ targets here: {targets}")
     
-    return dict(input_ids=input_ids, labels=targets)
+    return dict(input_ids=input_ids, labels=targets, instructions=instructions)
 
 
 def preprocess(
@@ -831,8 +837,8 @@ class WebDataset(Dataset):
             .map(self.decode_sample)
         )
         self.iterator = iter(self.dataset)
-        # self.modals = ["image", "video", "audio"]
-        self.modals = ["video", "audio"] # Placeholder data for video+audio
+        self.modals = ["image", "video", "audio"]
+        # self.modals = ["video", "audio"] # Placeholder data for video+audio
 
     def decode_sample(self, sample):
 
@@ -891,18 +897,20 @@ class WebDataset(Dataset):
             sample = next(self.iterator)
 
         ################# placeholder for video+audio ###################
-        sample['modal_list'] = ['VIDEO', 'AUDIO']
-        sample['video'] = torch.stack([sample['image']] * self.data_args.num_frames)
-        sample['audio'] = torch.randn(10000)
+        # sample['modal_list'] = ['VIDEO', 'AUDIO']
+        # sample['video'] = torch.stack([sample['image']] * self.data_args.num_frames)
+        # sample['audio'] = torch.randn(10000)
         #################################################################
 
         conversations = preprocess_multimodal(copy.deepcopy([sample["conversations"]]), self.data_args)
         data_dict = preprocess(conversations, self.tokenizer, sample['modal_list']) # TODO
         data_dict = dict(input_ids=data_dict["input_ids"][0],
-                        labels=data_dict["labels"][0])
+                        labels=data_dict["labels"][0],
+                        instructions=data_dict['instructions'][0])
         for modal in self.modals:
             if modal in sample:
                 data_dict[modal] = sample[modal]
+            
         return data_dict
 
     def process_video(self, video):
@@ -959,6 +967,8 @@ class DataCollatorForWebDataset(object):
                     batch[f"{modal}s"] = torch.stack(modal_data)
                 else:
                     batch[f"{modal}s"] = modal_data
+
+        batch['instructions'] = [instance['instructions'] for instance in instances]
 
         return batch
 
@@ -1138,7 +1148,8 @@ def train(attn_implementation=None):
         model.config.mm_projector_lr = training_args.mm_projector_lr
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
-        model.initialize_MM_tokenizer(model_args, tokenizer=tokenizer)
+        model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+        # model.initialize_MM_tokenizer(model_args, tokenizer=tokenizer)
 
     if model_args.audio_tower is not None:
         model.get_model().initialize_audio_modules(

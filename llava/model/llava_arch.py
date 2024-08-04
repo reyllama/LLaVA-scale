@@ -178,7 +178,6 @@ def unpad_image(tensor, original_size):
 
     return unpadded_tensor
 
-
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -195,6 +194,14 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().get_vision_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
+
+    def encode_mmodal(self, mmodal, instruction):
+        features = self.get_model().get_vision_tower()(mmodal)
+        if self.get_model().config.mm_projector_type == 'swinqformer':
+            features = self.get_model().mm_projector(features, instruction)
+        else:
+            features = self.get_model().mm_projector(features)
+        return features
 
     # def encode_videos(self, videos):
     #     assert videos.ndim == 5, f"Expected 5D tensor, got {videos.ndim}D tensor."
@@ -213,7 +220,7 @@ class LlavaMetaForCausalLM(ABC):
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images=None, image_sizes=None, videos=None, audios=None
+        images=None, image_sizes=None, videos=None, audios=None, instructions=None,
     ):
         
         MODAL_TOKEN_INDEX = IMAGE_TOKEN_INDEX
@@ -235,7 +242,10 @@ class LlavaMetaForCausalLM(ABC):
                 if type(images) is list:
                     images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
                 concat_images = torch.cat([image for image in images], dim=0)
-                image_features = self.encode_images(concat_images)
+                if len(instructions) > 0 and len(instructions[0]) > 0:
+                    image_features = self.encode_mmodal(concat_images, instructions)
+                else:
+                    image_features = self.encode_images(concat_images)
                 split_sizes = [image.shape[0] for image in images]
                 image_features = torch.split(image_features, split_sizes, dim=0)
                 mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
@@ -280,7 +290,10 @@ class LlavaMetaForCausalLM(ABC):
                 else:
                     raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
             else:
-                image_features = self.encode_images(images)
+                if len(instructions) > 0 and len(instructions[0]) > 0:
+                    image_features = self.encode_mmodal(images, instructions)
+                else:
+                    image_features = self.encode_images(images)
 
         if isinstance(image_features, list):
             image_features = torch.stack(image_features)

@@ -68,6 +68,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         videos: Optional[torch.FloatTensor] = None,
         audios: Optional[torch.FloatTensor] = None,
+        instructions: Optional[List[str]] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -89,7 +90,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 images,
                 image_sizes,
                 videos,
-                audios
+                audios,
+                instructions,
             )
 
         return super().forward(

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from transformers import CLIPVisionModel, CLIPImageProcessor, CLIPVisionConfig
+from transformers import AutoTokenizer, CLIPTextModel
 
 
 class CLIPVisionTower(nn.Module):
@@ -145,3 +146,55 @@ class CLIPVisionTowerS2(CLIPVisionTower):
     @property
     def hidden_size(self):
         return self.config.hidden_size * len(self.s2_scales)
+
+class CLIPTextTower(nn.Module):
+    def __init__(self, text_tower, args, delay_load=False):
+        super().__init__()
+
+        self.is_loaded =False
+        self.text_tower_name = text_tower
+        
+    def load_model(self, device_map=None):
+        if self.is_loaded:
+            print('{} is already loaded, `load_model` called again, skipping.'.format(self.text_tower_name))
+            return
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.text_tower_name)
+        self.text_tower = CLIPTextModel.from_pretrained(self.text_tower_name, device_map=device_map)
+        self.text_tower.requires_grad_(False)
+
+        self.is_loaded = True
+
+    @torch.no_grad()
+    def forward(self, text, pooled_output=False):
+        inputs = self.tokenizer(text, return_tensors='pt', padding=True, truncation=True)
+        for k, v in inputs.items():
+            inputs[k] = v.to(device=self.text_tower.device, dtype=torch.long)
+        outputs = self.text_tower(**inputs)
+        
+        if pooled_output:
+            return outputs.pooler_output
+        return outputs.last_hidden_state
+
+    @property
+    def dummy_feature(self):
+        return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)
+
+    @property
+    def dtype(self):
+        return self.text_tower.dtype
+
+    @property
+    def device(self):
+        return self.text_tower.device
+
+    @property
+    def config(self):
+        if self.is_loaded:
+            return self.text_tower.config
+        else:
+            return self.cfg_only
+
+    @property
+    def hidden_size(self):
+        return self.config.instruction_hidden_size
