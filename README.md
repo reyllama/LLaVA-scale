@@ -1,20 +1,20 @@
 # LLaVA-scale
 
-`Codebase to scale-up LLaVA.`
+Codebase to scale-up LLaVA.
 
 ## 🎯 Potential Issues for Scale-up
 
 ### \# 1-1. Data Scale-up
 
-> The current data pipeline assumes all images (videos) and their corresponding metadata to be stored locally. However, this will become easily infeasible when the dataset is scaled. Plus, there are more elegant ways to implement *lazy dataloading* without explicitly defining custom dataloading pipeline as in the original code base.
+ The current data pipeline assumes all images (videos) and their corresponding metadata to be stored locally. However, this will become easily infeasible when the dataset is scaled. Plus, there are more elegant ways to implement *lazy dataloading* without explicitly defining custom dataloading pipeline as in the original code base.
 
 ### \# 1-2. Model Scale-up
 
-> LLaVA is essentially made up of three architectural components: vision encoder, projector and the language model. In most (if not all) model variants, the language model with a huge number of parameters (7B~) takes up most of the compute resources. Therefore, to control compute resources with model scale-up, we need to pay careful attention to the number of tokens being computed by the language model. Current implementation takes little care of this, hence with higher spatial/temporal resolution input, the compute for the language model will become very expensive.
+ LLaVA is essentially made up of three architectural components: vision encoder, projector and the language model. In most (if not all) model variants, the language model with a huge number of parameters (7B~) takes up most of the compute resources. Therefore, to control compute resources with model scale-up, we need to pay careful attention to the number of tokens being computed by the language model. Current implementation takes little care of this, hence with higher spatial/temporal resolution input, the compute for the language model will become very expensive.
 
 ### \# 1-3. Team Scale-up
 
-> The code itself is overall well-written, but when more people are to contribute to this codebase, we need to make some parts more modular, especially the `train.py`. This file alone contains code for argument parsing, model configuration, dataset classs definition, data preprocessing, and the actual training, which could be refactored to enhance readability and reusability.
+ The code itself is overall well-written, but when more people are to contribute to this codebase, we need to make some parts more modular, especially the `train.py`. This file alone contains code for argument parsing, model configuration, dataset classs definition, data preprocessing, and the actual training, which could be refactored to enhance readability and reusability.
 
 ## 🎯 Proposed Modifications
 
